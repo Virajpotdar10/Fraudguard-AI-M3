@@ -30,24 +30,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables for loaded models
-model_fast = None
-model_accurate = None
+# Global variable for loaded model
+model = None
 
-# Explanation service URL
-# - Local/Docker: http://explanation_service:8001/explain
-# - Railway: set EXPLANATION_SERVICE_URL in Railway Variables
-EXPLANATION_SERVICE_URL = os.getenv(
-    "EXPLANATION_SERVICE_URL",
-    "https://fraudguard-ai-m3-production-619d.up.railway.app"
-)
-
-
-# # Model paths - works both locally and in Docker
+# Model path - works both locally and in Docker
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-FAST_MODEL_PATH = os.path.join(BASE_DIR, "ml", "model_fast.pkl")
-ACCURATE_MODEL_PATH = os.path.join(BASE_DIR, "ml", "model_accurate.pkl")
+MODEL_PATH = os.path.join(BASE_DIR, "ml", "model.pkl")
 
 FRAUD_HISTORY_FILE = os.path.join(BASE_DIR, "fraud_history.json")
 
@@ -106,14 +94,31 @@ def is_recurring_fraud_upi(upi_id: str) -> bool:
     history = load_fraud_history()
     return history.get(upi_id, {}).get("fraud_count", 0) >= 3
 
-def load_models():
-    global model_fast, model_accurate
-    model_fast = joblib.load(FAST_MODEL_PATH)
-    model_accurate = joblib.load(ACCURATE_MODEL_PATH)
+# Explanation service URL
+# - Local/Docker: http://explanation_service:8001/explain
+# - Railway: set EXPLANATION_SERVICE_URL in Railway Variables
+EXPLANATION_SERVICE_URL = os.getenv(
+    "EXPLANATION_SERVICE_URL",
+    "https://fraudguard-ai-m3-production-619d.up.railway.app"
+)
+
+def load_model():
+    """Load the trained ML model from disk."""
+    global model
+    try:
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
+        
+        model = joblib.load(MODEL_PATH)
+        print(f"[OK] Model loaded successfully from {MODEL_PATH}")
+        return model
+    except Exception as e:
+        print(f"[ERROR] Error loading model: {str(e)}")
+        raise
 
 @app.on_event("startup")
 async def startup_event():
-    load_models()
+    load_model()
     if not os.path.exists(FRAUD_HISTORY_FILE):
         save_fraud_history({})
 
@@ -121,51 +126,54 @@ async def startup_event():
 async def health_check():
     return {
         "status": "ok",
-        "fast_model_loaded": model_fast is not None,
-        "accurate_model_loaded": model_accurate is not None
+        "model_loaded": model is not None
     }
 
 @app.post("/predict", response_model=FraudPrediction)
 async def predict_fraud(transaction: TransactionInput):
-    model = model_fast if transaction.mode == "fast" else model_accurate
-
-    base_features = [
-        transaction.transactionAmount,
-        transaction.transactionAmountDeviation,
-        transaction.timeAnomaly,
-        transaction.locationDistance,
-        transaction.merchantNovelty,
-        transaction.transactionFrequency
-    ]
-
-    if transaction.mode == "accurate":
-        features = np.array([base_features + [
-            transaction.transactionAmount * transaction.locationDistance,
-            transaction.transactionAmountDeviation * transaction.merchantNovelty,
-            transaction.timeAnomaly / (transaction.transactionFrequency + 1)
+    if model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
+    
+    try:
+        # Prepare features in the exact order used during training
+        features = np.array([[
+            transaction.transactionAmount,
+            transaction.transactionAmountDeviation,
+            transaction.timeAnomaly,
+            transaction.locationDistance,
+            transaction.merchantNovelty,
+            transaction.transactionFrequency
         ]])
-    else:
-        features = np.array([base_features])
+        
+        # Get prediction (0 = Legit, 1 = Fraud)
+        prediction = model.predict(features)[0]
+        
+        # Get probability/confidence score
+        probabilities = model.predict_proba(features)[0]
+        fraud_probability = probabilities[1]  # Probability of fraud (class 1)
+        
+        # Convert to boolean and return
+        is_fraud = bool(prediction == 1)
+        
+        # Get AI explanation
+        explanation = get_ai_explanation(transaction, is_fraud, fraud_probability)
 
-    prediction = model.predict(features)[0]
-    probability = model.predict_proba(features)[0][1]
-    is_fraud = prediction == 1
-
-    fraud_count = update_fraud_history(transaction.upiId, is_fraud)
-    recurring = fraud_count >= 3
-
-    explanation = get_ai_explanation(transaction, is_fraud, probability)
-
-    return FraudPrediction(
-        fraud=is_fraud,
-        risk_score=round(float(probability), 4),
-        model_used=transaction.mode,
-        recurring_fraud_upi=recurring,
-        fraud_count=fraud_count,
-        explanation=explanation
-    )
+        return FraudPrediction(
+            fraud=is_fraud,
+            risk_score=round(float(fraud_probability), 4),
+            explanation=explanation
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction error: {str(e)}"
+        )
 
 def get_ai_explanation(transaction: TransactionInput, is_fraud: bool, risk_score: float) -> Optional[str]:
+    """Calls the explanation service to get an AI-generated explanation."""
+    url = f"{EXPLANATION_SERVICE_URL}/explain"
+    
     payload = {
         "transactionAmount": transaction.transactionAmount,
         "transactionAmountDeviation": transaction.transactionAmountDeviation,
@@ -176,13 +184,29 @@ def get_ai_explanation(transaction: TransactionInput, is_fraud: bool, risk_score
         "isFraud": is_fraud,
         "riskScore": risk_score
     }
-
+    
     try:
-        response = requests.post(EXPLANATION_SERVICE_URL, json=payload, timeout=30)
-        response.raise_for_status()
-        return response.json().get("explanation")
-    except Exception:
+        # Increased timeout to 30 seconds to handle model generation time
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+        result = response.json().get("explanation")
+        if result:
+            return result
+        else:
+            print("[WARNING] Explanation service returned empty explanation")
+            return None
+    except requests.exceptions.Timeout:
+        print("[ERROR] Explanation service timeout (exceeded 30 seconds)")
+        return "AI explanation service is taking too long to respond."
+    except requests.exceptions.ConnectionError as e:
+        print(f"[ERROR] Could not connect to explanation service at {url}: {e}")
         return "AI explanation service is currently unavailable."
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Error calling explanation service: {type(e).__name__}: {e}")
+        return "AI explanation service encountered an error."
+    except Exception as e:
+        print(f"[ERROR] Unexpected error getting explanation: {type(e).__name__}: {e}")
+        return None
 
 if __name__ == "__main__":
     import uvicorn
