@@ -7,6 +7,10 @@ app = FastAPI(
     description="Lightweight explanation generator for fraud predictions",
     version="1.0.0"
 )
+@app.get("/")
+def root():
+    return {"service": "FraudGuard Explanation API"}
+
 
 class PredictionDetails(BaseModel):
     transactionAmount: float
